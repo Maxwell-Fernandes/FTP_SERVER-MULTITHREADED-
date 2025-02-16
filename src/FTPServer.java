@@ -1,131 +1,171 @@
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.sql.SQLOutput;
-
-import static java.lang.System.out;
-import static java.lang.System.setOut;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class FTPServer {
+    static final int PORT = 2121;
+    static final String DIRECTORY = "files";
+    static final int THREAD_POOL_SIZE = 10;
 
-    static final int port = 2121;
-    static final String dir ="files";
+    public static void main(String[] args) {
+        File dir = new File(DIRECTORY);
+        if (!dir.exists()) dir.mkdirs();
 
-    public static void main(String[] args) throws IOException {
-        File diretory = new File(dir);
-        if(!diretory.exists()){
-            diretory.mkdir();
-        }
+        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+            System.out.println("Server started on port " + PORT);
+            ExecutorService threadPool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
 
-        try(ServerSocket serverSocket = new ServerSocket(port)){
-            out.println("Server started on port "+port);
+            while (true) {
                 Socket clientSocket = serverSocket.accept();
-                out.println("client connected "+ clientSocket.getInetAddress());
-
-                new Thread(new FTPclienthandler(clientSocket)).start();
-
-        } catch (Exception e) {
-            e.printStackTrace();
+                System.out.println("Client connected: " + clientSocket.getInetAddress());
+                threadPool.execute(new FTPClientHandler(clientSocket));
+            }
+        } catch (IOException e) {
+            System.err.println("Server error: " + e.getMessage());
         }
     }
 }
 
-class FTPclienthandler implements Runnable{
-    private Socket clientSocket;
-    private static final String dir = "files";
+class FTPClientHandler implements Runnable {
+    private final Socket clientSocket;
 
-    FTPclienthandler(Socket clientSocket){
-        this.clientSocket= clientSocket;
+    FTPClientHandler(Socket clientSocket) {
+        this.clientSocket = clientSocket;
     }
+
     @Override
     public void run() {
         try (DataInputStream in = new DataInputStream(clientSocket.getInputStream());
-             DataOutputStream out = new DataOutputStream((clientSocket.getOutputStream()))
-        ) {
+             DataOutputStream out = new DataOutputStream(clientSocket.getOutputStream())) {
+
             while (true) {
+                System.out.println("Waiting for client response");
                 String command = in.readUTF();
+                System.out.println("Received command: " + command);
+
                 if (command.startsWith("UPLOAD")) {
-                    recieveFile(in, command.substring(7));
+                    receiveFile(in, command.substring(7));
+                    out.writeUTF("File received successfully");
                 } else if (command.startsWith("DOWNLOAD")) {
-
-                    sendFile(out, command.substring((9)));
-                } else if (command.startsWith("LIST")) {
+                    String[] parts = command.split(" ");
+                    if (parts.length == 2) {
+                        sendFullFile(out, parts[1]);
+                    } else if (parts.length == 4) {
+                        long startByte = Long.parseLong(parts[2]);
+                        long endByte = Long.parseLong(parts[3]);
+                        sendChunkedFile(out, parts[1], startByte, endByte);
+//                        out.writeUTF("downloaded");
+                    }
+                } else if (command.equals("LIST")) {
                     listFiles(out);
-                }else if(command.startsWith("EXIT")){
-                    System.out.println("Exiting");
+                } else if (command.equals("EXIT")) {
                     break;
+                } else {
+                    out.writeUTF("Unknown command");
                 }
-
             }
         } catch (IOException e) {
-            throw new RuntimeException(e);
-        }finally {
-            try
-            {
-                clientSocket.close();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-
+            System.err.println("Client connection error: " + e.getMessage());
         }
     }
 
-    private void listFiles(DataOutputStream out) throws IOException {
-        File folder = new File("files");
-        File []filesList = folder.listFiles();
-        if(filesList==null || filesList.length == 0){
-            out.writeUTF("NO files found");
-            out.flush();
-            return ;
+    private void sendFullFile(DataOutputStream out, String filename) throws IOException {
+        File file = new File(FTPServer.DIRECTORY, filename);
+        if (!file.exists()) {
+            out.writeUTF("File does not exist");
+            return;
         }
-//        StringBuilder flist = new StringBuilder("Available files \n");
 
-        for(File file : filesList){
-//            flist.append("-").append(file.getName()).append("\n");
-            out.writeUTF(file.getName());
-        }
-        out.writeUTF("END_OF_FILE");
-        out.flush();
-        System.out.println("listed sucdessfully");
-    }
-
-    private void sendFile(DataOutputStream out, String substring) throws IOException {
-        substring = substring.trim();
-        File file = new File(dir + "/"+substring);
-        System.out.println("Looking for files in "+file.getAbsolutePath());
-        if(!file.exists()){
-            out.writeUTF("file not exist");
-            return ;
-        }
         out.writeUTF("OK");
         out.writeLong(file.length());
 
-        try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file))){
-            byte[] buffer = new byte[8192];
-            int bytesread;
-            while ((bytesread = bis.read(buffer))!=-1){
-                out.write(buffer,0,bytesread);
+        try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file))) {
+            byte[] buffer = new byte[64 * 1024];
+            int bytesRead;
+            while ((bytesRead = bis.read(buffer)) != -1) {
+                out.write(buffer, 0, bytesRead);
             }
         }
-        out.writeUTF("OK");
-        System.out.println("File sent "+substring);
+
+        out.writeUTF("FILE_SENT");
+        System.out.println("File sent: " + filename);
     }
 
-    private void recieveFile(DataInputStream in, String filename) throws IOException {
-        filename=filename.trim();
-        File file = new File(dir,filename);
-        out.println("recieving files in "+file.getAbsolutePath());
-        try(BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(file))){
-            long fileSize = in.readLong();
-            byte[] buffer = new byte[8192];
-            int byteRead;
-            int totalRead = 0;
+    private void sendChunkedFile(DataOutputStream out, String filename, long startByte, long endByte) throws IOException {
+        File file = new File(FTPServer.DIRECTORY, filename);
+        if (!file.exists()) {
+            out.writeUTF("File does not exist");
+            out.flush();
+            return;
+        }
 
-            while(totalRead<fileSize && (byteRead = in.read(buffer))!=-1){
-                bos.write(buffer,0,byteRead);
-                totalRead+=byteRead;
+        out.writeUTF("OK");
+        long chunkSize = endByte - startByte + 1;
+        out.writeLong(chunkSize);
+
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            raf.seek(startByte);
+            byte[] buffer = new byte[64 * 1024];
+            long totalSent = 0;
+
+            while (totalSent < chunkSize) {
+                int bytesToRead = (int) Math.min(buffer.length, chunkSize - totalSent);
+                int bytesRead = raf.read(buffer, 0, bytesToRead);
+                if (bytesRead == -1){
+                    break;
+                }
+                out.write(buffer, 0, bytesRead);
+                out.flush();
+                totalSent += bytesRead;
+
             }
         }
-        out.println("file recieved "+filename);
+
+        try {
+            out.writeUTF("CHUNK_RECEIVED");
+            out.flush();
+            System.out.println("Chunk sent: " + startByte + " to " + endByte);
+        } catch (IOException e) {
+            System.err.println("ERROR: Failed to send CHUNK_RECEIVED for " + startByte + " to " + endByte);
+        }
+    }
+
+    private void receiveFile(DataInputStream in, String filename) throws IOException {
+        File file = new File(FTPServer.DIRECTORY, filename);
+        try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(file))) {
+            long fileSize = in.readLong();
+            byte[] buffer = new byte[64 * 1024];
+            long totalRead = 0;
+
+            while (totalRead < fileSize) {
+                int bytesToRead = (int) Math.min(buffer.length, fileSize - totalRead);
+                int bytesRead = in.read(buffer, 0, bytesToRead);
+                if (bytesRead == -1) break;
+                bos.write(buffer, 0, bytesRead);
+                totalRead += bytesRead;
+            }
+        }
+        System.out.println("File received: " + filename);
+    }
+
+    private void listFiles(DataOutputStream out) throws IOException {
+        File folder = new File(FTPServer.DIRECTORY);
+        File[] files = folder.listFiles();
+        if (files == null || files.length == 0) {
+            out.writeUTF("No files available");
+            out.flush();
+            return;
+        }
+        for (File file : files) {
+            out.writeUTF(file.getName());
+            out.flush();
+        }
+        out.writeUTF("END_OF_LIST");
+        out.flush();
+        out.writeUTF("FILES LISTED SUCCESSFULLY");
+        out.flush();
+        System.out.println("Files Listed Successfully");
     }
 }
